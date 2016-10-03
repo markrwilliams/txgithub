@@ -16,78 +16,78 @@
 import re
 import json
 from twisted.python import log
-from twisted.internet import defer, ssl
-from twisted.web import client
+from twisted.internet import defer
+import twisted.web.error
+
+import treq
 
 from txgithub.constants import HOSTED_BASE_URL
 
-class _GithubPageGetter(client.HTTPPageGetter):
-
-    def handleStatus_204(self):
-        # github returns 204 for e.g., DELETE operations
-        self.handleStatus_200()
-
-class _GithubHTTPClientFactory(client.HTTPClientFactory):
-
-    protocol = _GithubPageGetter
-
-    # dont' log about starting and stopping
-    noisy = False
 
 class GithubApi(object):
     # Interface to the github API, using
     # - API v3
     # - optional user/pass auth (token is not available with v3)
     # - async API
+    user_agent = 'txgithub'
+    timeout = 30
 
-    def __init__(self, oauth2_token, baseURL=None, reactor=None):
+    _treq = treq
+
+    def __init__(self, oauth2_token, baseURL=None, agent=None):
         self._baseURL = baseURL or HOSTED_BASE_URL
         self.oauth2_token = oauth2_token
         self.rateLimitWarningIssued = False
-        self.contextFactory = ssl.ClientContextFactory()
-        if reactor is None:
-            from twisted.internet import reactor
-        self.reactor = reactor
+        self.agent = None
 
     def _makeHeaders(self):
         assert self.oauth2_token, "no token specified"
-        return { 'Authorization' : 'token ' + self.oauth2_token }
+        return {
+            'Authorization': 'token ' + self.oauth2_token,
+            'User-Agent': self.user_agent
+        }
 
     def makeRequest(self, url_args, post=None, method='GET', page=0):
         headers = self._makeHeaders()
 
         url = self._baseURL
         url += '/'.join(url_args)
-        if page:
-            url += "?page=%d" % page
 
-        postdata = None
+        params = {}
+        if page:
+            params['page'] = page
+
+        data = None
         if post:
-            postdata = json.dumps(post)
+            data = json.dumps(post)
 
         log.msg("fetching '%s'" % (url,), system='github')
-        factory = _GithubHTTPClientFactory(url, headers=headers,
-                    postdata=postdata, method=method,
-                    agent='txgithub', followRedirect=0,
-                    timeout=30)
+        d = self._treq.request(method, url,
+                               params=params,
+                               headers=headers,
+                               data=data,
+                               allow_redirects=False,
+                               timeout=self.timeout)
 
-        self.reactor.connectSSL(factory.host, factory.port, factory,
-                                self.contextFactory)
-        d = factory.deferred
         @d.addCallback
-        def check_ratelimit(data):
-            self.last_response_headers = factory.response_headers
-            remaining = int(factory.response_headers.get(
-                                    'x-ratelimit-remaining', [0])[0])
+        def check_code(response):
+            if 200 <= response.code < 300:
+                return response
+            raise twisted.web.error.Error(code=response.code,
+                                          message=response.phrase)
+
+        @d.addCallback
+        def check_ratelimit(response):
+            self.last_response_headers = headers = dict(
+                response.headers.getAllRawHeaders())
+            remaining = int(headers.get('x-ratelimit-remaining',
+                                        [0])[0])
             if remaining < 100 and not self.rateLimitWarningIssued:
                 log.msg("warning: only %d Github API requests remaining "
                         "before rate-limiting" % remaining)
                 self.rateLimitWarningIssued = True
-            return data
-        @d.addCallback
-        def un_json(data):
-            if data:
-                return json.loads(data)
+            return response.json()
+
         return d
 
     link_re = re.compile('<([^>]*)>; rel="([^"]*)"')

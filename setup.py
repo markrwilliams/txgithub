@@ -29,6 +29,7 @@ setup(
     scripts=['bin/gist', 'bin/get-github-token'],
     install_requires=[
         'twisted >= 12.3.0',
+        'treq',
         'pyopenssl',
     ],
     zip_safe=False,
